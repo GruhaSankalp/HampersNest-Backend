@@ -94,3 +94,20 @@ npm start
 ## 🔒 Security & Database Best Practices
 - Database migrations, schema versioning, and table alterations are isolated in the dedicated [`HampersNest-Database`](https://github.com/GruhaSankalp/HampersNest-Database) repository.
 - Sensitive files (`.env`, `wallet/`) are strictly git-ignored and never committed to source control.
+
+---
+
+## 🤖 GitHub Actions CI/CD Deployment
+
+Automated production deployment is configured in `.github/workflows/deploy.yml`. Whenever code is pushed to `main`, GitHub Actions connects to the production server via SSH, pulls the latest code, installs dependencies, and gracefully reloads PM2 without downtime.
+
+### Required GitHub Repository Secrets
+Navigate to **GitHub Repository -> Settings -> Secrets and variables -> Actions** and add:
+
+| Secret Name | Value Description | Example |
+| :--- | :--- | :--- |
+| `SERVER_HOST` | Production Server IP / Host | `140.245.235.248` |
+| `SERVER_USER` | SSH Username | `ubuntu` |
+| `SERVER_SSH_KEY` | Entire private SSH key content | Contents of `ssh-key-2026-06-27.key` |
+
+
