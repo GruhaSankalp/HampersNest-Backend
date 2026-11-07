@@ -1,0 +1,169 @@
+import { Setting, Category } from '../database/models.js';
+import { defaultPolicies } from '../utils/defaultPolicies.js';
+
+export const DEFAULT_CATEGORIES = [
+  { id: '0e2b44c9-4ac3-4c86-a981-1519577d1887', label: 'Wedding' },
+  { id: 'df03121d-bf82-4cf3-86f5-d1bc928b80de', label: 'Baby Shower' },
+  { id: 'f9b85f1b-32d8-4941-a624-30c3b46f1083', label: 'Housewarming' },
+  { id: 'fa3af7ce-b972-4889-b5f8-5e827d96078b', label: 'Brass Gifting' },
+  { id: '587f009c-51fa-4c9b-aa85-97304d3f89ed', label: 'Corporate Gifting' },
+  { id: '7253ccfa-99c9-43b7-9ec5-07907fed7e06', label: 'Customized Hampers' }
+];
+
+const normalizeCategories = (categories) => {
+  if (!Array.isArray(categories)) return DEFAULT_CATEGORIES;
+
+  const seen = new Set();
+  return categories
+    .map((category) => {
+      if (typeof category === 'string') {
+        const value = category.trim();
+        return { id: value, label: value };
+      }
+
+      const id = String(category?.id || '').trim();
+      const label = String(category?.label || category?.name || '').trim();
+      return { id, label };
+    })
+    .filter((category) => {
+      if (!category.id || seen.has(category.id)) return false;
+      seen.add(category.id);
+      return true;
+    });
+};
+
+// @desc    Get all active settings
+// @route   GET /api/settings
+// @access  Public
+export const getSettings = async (req, res) => {
+  try {
+    const settingsList = await Setting.findAll();
+    const settingsObj = {};
+    settingsList.forEach(s => {
+      settingsObj[s.key] = s.value;
+    });
+
+    // Auto-initialize default policies if they don't exist or are empty
+    if (!settingsObj.customPolicies || !Array.isArray(settingsObj.customPolicies) || settingsObj.customPolicies.length === 0) {
+      settingsObj.customPolicies = defaultPolicies;
+      await Setting.upsert({ key: 'customPolicies', value: defaultPolicies });
+    } else {
+      // Ensure all core policies are present
+      let updated = false;
+      for (const defPol of defaultPolicies) {
+        if (!settingsObj.customPolicies.find(p => p.id === defPol.id)) {
+          settingsObj.customPolicies.push(defPol);
+          updated = true;
+        }
+      }
+      if (updated) {
+        await Setting.upsert({ key: 'customPolicies', value: settingsObj.customPolicies });
+      }
+    }
+
+    // Auto-initialize bulkDiscountSettings
+    if (!settingsObj.bulkDiscountSettings) {
+      const defaultBulkDiscountSettings = {
+        enabled: true,
+        ruleType: 'Product Quantity',
+        heading: '🎉 Bulk Order Discounts',
+        footerNote: '✓ Automatically applied at checkout.',
+        rules: [
+          { minQty: 50, discountPercent: 5 },
+          { minQty: 100, discountPercent: 10 },
+          { minQty: 200, discountPercent: 15 }
+        ]
+      };
+      settingsObj.bulkDiscountSettings = defaultBulkDiscountSettings;
+      await Setting.upsert({ key: 'bulkDiscountSettings', value: defaultBulkDiscountSettings });
+    }
+
+    // Auto-initialize priceRangeCards
+    if (!settingsObj.priceRangeCards) {
+      const defaultPriceRangeCards = [
+        { id: 'price-under-100', name: 'Under ₹100', slug: 'under-100', minPrice: 0, maxPrice: 100, image: '/assets/price_under_100.png', sortOrder: 1, isActive: true },
+        { id: 'price-100-200', name: '₹100–₹200', slug: '100-200', minPrice: 100, maxPrice: 200, image: '/assets/price_100_200.png', sortOrder: 2, isActive: true },
+        { id: 'price-200-300', name: '₹200–₹300', slug: '200-300', minPrice: 200, maxPrice: 300, image: '/assets/price_200_300.png', sortOrder: 3, isActive: true },
+        { id: 'price-300-plus', name: '₹300 & Above', slug: '300-plus', minPrice: 300, maxPrice: null, image: '/assets/price_300_plus.png', sortOrder: 4, isActive: true }
+      ];
+      settingsObj.priceRangeCards = defaultPriceRangeCards;
+      await Setting.upsert({ key: 'priceRangeCards', value: defaultPriceRangeCards });
+    }
+
+    // Auto-initialize pdfDeliveryInfo
+    if (!settingsObj.pdfDeliveryInfo) {
+      const defaultPdfDeliveryInfo = `• Dispatch within 2–7 business days
+• Delivery across India & International
+• Shipping calculated based on actual or volumetric weight
+• Bulk corporate orders available
+• Premium packaging included`;
+      settingsObj.pdfDeliveryInfo = defaultPdfDeliveryInfo;
+      await Setting.upsert({ key: 'pdfDeliveryInfo', value: defaultPdfDeliveryInfo });
+    }
+
+    // Fetch categories from the Categories table
+    const categoriesDb = await Category.findAll({ order: [['createdAt', 'ASC']] });
+    const categoriesFormatted = categoriesDb.map(c => ({
+      id: c.id,
+      label: c.name,
+      parentId: c.parentId || null
+    }));
+    
+    res.json({
+      ...settingsObj,
+      announcementText: settingsObj.announcementText || 'Welcome to HampersNest! Customized Hampers and Return Gifts Hyderabad.',
+      announcementActive: settingsObj.announcementActive !== undefined ? settingsObj.announcementActive : false,
+      activeTheme: settingsObj.activeTheme || 'theme-default',
+      categories: categoriesFormatted.length > 0 ? categoriesFormatted : DEFAULT_CATEGORIES
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// @desc    Update settings configurations
+// @route   PUT /api/settings
+// @access  Private/Admin
+export const updateSettings = async (req, res) => {
+  const { announcementText, announcementActive, activeTheme, categories } = req.body;
+
+  try {
+    const promises = [];
+    
+    if (categories !== undefined) {
+      const normalizedCategories = normalizeCategories(categories);
+      if (normalizedCategories.length > 0) {
+        promises.push((async () => {
+          for (const cat of normalizedCategories) {
+            await Category.findOrCreate({
+              where: { id: cat.id },
+              defaults: { name: cat.label }
+            });
+          }
+        })());
+      }
+    }
+
+    for (const [key, rawValue] of Object.entries(req.body)) {
+      if (key !== 'categories') {
+        let valueToSave = rawValue;
+        if (typeof rawValue === 'string') {
+          const trimmed = rawValue.trim();
+          valueToSave = trimmed === '' ? null : trimmed;
+        }
+
+        promises.push(
+          Setting.upsert({
+            key,
+            value: valueToSave
+          })
+        );
+      }
+    }
+
+    await Promise.all(promises);
+    res.json({ message: 'Settings updated successfully' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};

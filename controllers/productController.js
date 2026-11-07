@@ -1,0 +1,908 @@
+import { Op } from 'sequelize';
+import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { Product, Category, ProductCategory } from '../database/models.js';
+import { sequelize } from '../database/db.js';
+import { generateWatermarkedImage } from '../utils/imageProcessor.js';
+import { isR2Configured, getR2Client } from '../utils/r2Client.js';
+import { PutObjectCommand } from '@aws-sdk/client-s3';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+export const validateAndNormalizeAssignments = async (assignments, fallbackCategory, fallbackSubCategory) => {
+  let rawList = [];
+  if (Array.isArray(assignments) && assignments.length > 0) {
+    rawList = assignments;
+  } else if (fallbackCategory) {
+    rawList = [{ categoryId: fallbackCategory, subcategoryId: fallbackSubCategory || null }];
+  }
+
+  if (!rawList || rawList.length === 0) {
+    const error = new Error('Please provide at least one category assignment');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const allCategories = await Category.findAll({ raw: true });
+  const categoryMap = new Map();
+  allCategories.forEach(c => categoryMap.set(c.id, c));
+
+  const normalized = [];
+  const seenCombinations = new Set();
+
+  for (let i = 0; i < rawList.length; i++) {
+    const item = rawList[i];
+    const catId = item.categoryId || item.category;
+    const subId = item.subcategoryId !== undefined ? item.subcategoryId : (item.subCategoryId !== undefined ? item.subCategoryId : (item.subCategory || null));
+
+    if (!catId) {
+      const error = new Error(`Category is required for assignment #${i + 1}`);
+      error.statusCode = 400;
+      throw error;
+    }
+
+    const catObj = categoryMap.get(catId);
+    if (!catObj) {
+      const error = new Error(`Invalid category "${catId}" selected in assignment #${i + 1}`);
+      error.statusCode = 400;
+      throw error;
+    }
+
+    if (subId) {
+      const subObj = categoryMap.get(subId);
+      if (!subObj) {
+        const error = new Error(`Invalid subcategory "${subId}" selected in assignment #${i + 1}`);
+        error.statusCode = 400;
+        throw error;
+      }
+      if (subObj.parentId !== catId) {
+        const error = new Error(`Subcategory "${subObj.name}" does not belong to category "${catObj.name}" in assignment #${i + 1}`);
+        error.statusCode = 400;
+        throw error;
+      }
+    }
+
+    const comboKey = `${catId}::${subId || ''}`;
+    if (seenCombinations.has(comboKey)) {
+      const error = new Error(`Duplicate assignment detected: Category "${catObj.name}" with subcategory "${subId ? categoryMap.get(subId).name : 'None'}"`);
+      error.statusCode = 400;
+      throw error;
+    }
+    seenCombinations.add(comboKey);
+
+    normalized.push({
+      categoryId: catId,
+      subCategoryId: subId || null,
+      isPrimary: normalized.length === 0
+    });
+  }
+
+  return normalized;
+};
+
+export const enrichProductWithCategories = (productJson, assignments, categoryMap) => {
+  const assignmentList = Array.isArray(assignments) ? assignments : [];
+  
+  const effectiveAssignments = assignmentList.length > 0 ? assignmentList : (productJson.category ? [{
+    categoryId: productJson.category,
+    subCategoryId: productJson.subCategory || null,
+    isPrimary: true
+  }] : []);
+
+  productJson.categoryAssignments = effectiveAssignments.map(a => {
+    const catId = a.categoryId || a.category;
+    const subId = a.subCategoryId !== undefined ? a.subCategoryId : (a.subcategoryId !== undefined ? a.subcategoryId : a.subCategory);
+    return {
+      categoryId: catId,
+      subcategoryId: subId || null,
+      isPrimary: !!a.isPrimary,
+      categoryName: categoryMap[catId] || catId,
+      subcategoryName: subId ? (categoryMap[subId] || subId) : ''
+    };
+  });
+
+  const allCatIds = [...new Set(productJson.categoryAssignments.map(a => a.categoryId).filter(Boolean))];
+  const allSubCatIds = [...new Set(productJson.categoryAssignments.map(a => a.subCategoryId).filter(Boolean))];
+
+  productJson.allCategories = allCatIds;
+  productJson.allSubCategories = allSubCatIds;
+  productJson.allCategoryNames = allCatIds.map(id => categoryMap[id] || id);
+  productJson.allSubcategoryNames = allSubCatIds.map(id => categoryMap[id] || id);
+
+  const primary = productJson.categoryAssignments.find(a => a.isPrimary) || productJson.categoryAssignments[0];
+  if (primary) {
+    productJson.category = primary.categoryId;
+    productJson.subCategory = primary.subCategoryId || '';
+    productJson.categoryName = primary.categoryName;
+    productJson.subcategoryName = primary.subcategoryName;
+  } else {
+    productJson.categoryName = categoryMap[productJson.category] || productJson.category || '';
+    productJson.subcategoryName = productJson.subCategory ? (categoryMap[productJson.subCategory] || productJson.subCategory) : '';
+  }
+
+  return productJson;
+};
+
+// @desc    Get all products (Paginated & Filtered)
+// @route   GET /api/products
+// @access  Public
+export const getProducts = async (req, res) => {
+  try {
+    const isAll = req.query.all === 'true';
+    const noLimit = req.query.nolimit === 'true';
+    const page = parseInt(req.query.page, 10) || 1;
+    // Bypass limit if requesting all products for admin or storefront full catalogue
+    const limit = (isAll || noLimit) ? null : (parseInt(req.query.limit, 10) || 100);
+    const offset = (isAll || noLimit) ? null : (page - 1) * limit;
+
+    const filter = {};
+    if (!isAll) {
+      filter.isActive = { [Op.ne]: false };
+    }
+    
+    // Advanced filtering across multi-category assignments and legacy fields
+    if (req.query.category || req.query.subCategory) {
+      const pcWhere = {};
+      if (req.query.category) pcWhere.categoryId = req.query.category;
+      if (req.query.subCategory) pcWhere.subCategoryId = req.query.subCategory;
+
+      const matchingAssignments = await ProductCategory.findAll({
+        where: pcWhere,
+        attributes: ['productId'],
+        raw: true
+      });
+      const matchedProductIds = [...new Set(matchingAssignments.map(a => a.productId))];
+
+      filter[Op.or] = [
+        { id: { [Op.in]: matchedProductIds } },
+        {
+          ...(req.query.category && { category: req.query.category }),
+          ...(req.query.subCategory && { subCategory: req.query.subCategory })
+        }
+      ];
+    }
+
+    if (req.query.featured === 'true') filter.isFeatured = true;
+    if (req.query.search) {
+      filter.name = { [Op.like]: `%${req.query.search}%` };
+    }
+    if (req.query.lowStock === 'true') {
+      filter.stockQuantity = { [Op.lte]: 5 }; // Define low stock threshold
+    }
+
+    const { count, rows } = await Product.findAndCountAll({
+      where: filter,
+      include: [
+        {
+          model: ProductCategory,
+          as: 'categoryAssignments',
+          required: false
+        }
+      ],
+      distinct: true,
+      order: [['createdAt', 'DESC']],
+      ...(limit !== null && { limit, offset })
+    });
+
+    const allCategories = await Category.findAll({ raw: true });
+    const categoryMap = {};
+    allCategories.forEach(c => categoryMap[c.id] = c.name);
+
+    const products = rows.map(r => {
+      const p = r.toJSON();
+      return enrichProductWithCategories(p, p.categoryAssignments, categoryMap);
+    });
+
+    res.json({
+      products: products,
+      total: count,
+      page: isAll ? 1 : page,
+      totalPages: isAll ? 1 : Math.ceil(count / limit)
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// @desc    Get product by ID
+// @route   GET /api/products/:id
+// @access  Public
+export const getProductById = async (req, res) => {
+  try {
+    const product = await Product.findOne({
+      where: { id: req.params.id },
+      include: [
+        {
+          model: ProductCategory,
+          as: 'categoryAssignments',
+          required: false
+        }
+      ]
+    });
+    if (product) {
+      const allCategories = await Category.findAll({ raw: true });
+      const categoryMap = {};
+      allCategories.forEach(c => categoryMap[c.id] = c.name);
+
+      const p = enrichProductWithCategories(product.toJSON(), product.categoryAssignments, categoryMap);
+      res.json(p);
+    } else {
+      res.status(404).json({ message: 'Product not found' });
+    }
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// @desc    Create new product
+// @route   POST /api/products
+// @access  Private/Admin
+export const createProduct = async (req, res) => {
+  const { name, sku, price, discountPrice, originalPrice, image, images, videoUrls, category, subCategory, categoryAssignments, occasion, tags, stockQuantity, masterCategory, rating, description, shortDescription, details, customization, shipping, isFeatured, isActive, customGiftTagEnabled, addonsEnabled, customAddons, customizationText, deliveryInfoText, watermarkSettings, variants, variantsEnabled } = req.body;
+
+  if (!name || price === undefined || price === null || (!category && (!categoryAssignments || categoryAssignments.length === 0))) {
+    return res.status(400).json({ message: 'Please provide name, price, and category' });
+  }
+
+  const transaction = await sequelize.transaction();
+  try {
+    const uniqueId = req.body.id || crypto.randomUUID();
+    const validatedAssignments = await validateAndNormalizeAssignments(categoryAssignments, category, subCategory);
+    const primaryCat = validatedAssignments[0].categoryId;
+    const primarySubCat = validatedAssignments[0].subCategoryId || '';
+
+    const createdProduct = await Product.create({
+      id: uniqueId,
+      name,
+      sku: sku || uniqueId.substring(0, 8).toUpperCase(),
+      price: Number(price),
+      discountPrice: discountPrice ? Number(discountPrice) : 0,
+      originalPrice: originalPrice ? Number(originalPrice) : 0,
+      image: image || '/assets/hero_banner.png',
+      images: Array.isArray(images) ? images : [],
+      videoUrls: Array.isArray(videoUrls) ? videoUrls : [],
+      category: primaryCat,
+      masterCategory: masterCategory || primaryCat,
+      subCategory: primarySubCat,
+      occasion: occasion || '',
+      tags: Array.isArray(tags) ? tags : [],
+      stockQuantity: stockQuantity !== undefined ? Number(stockQuantity) : 0,
+      rating: rating ? Number(rating) : 4.5,
+      description: description || '',
+      shortDescription: shortDescription || '',
+      details: Array.isArray(details) ? details : [],
+      customization: Array.isArray(customization) ? customization : [],
+      shipping: Array.isArray(shipping) ? shipping : [],
+      customGiftTagEnabled: customGiftTagEnabled !== undefined ? !!customGiftTagEnabled : true,
+      addonsEnabled: addonsEnabled !== undefined ? !!addonsEnabled : true,
+      customAddons: Array.isArray(customAddons) ? customAddons : [],
+      customizationText: customizationText || 'Make your gift extra special by adding a custom gift tag and selecting add-ons.',
+      deliveryInfoText: deliveryInfoText || 'Standard Delivery: 3-5 business days. Express Delivery available at checkout.',
+      watermarkSettings: watermarkSettings || undefined,
+      variants: Array.isArray(variants) ? variants : [],
+      variantsEnabled: !!variantsEnabled,
+      isFeatured: !!isFeatured,
+      isActive: isActive !== undefined ? !!isActive : true
+    }, { transaction });
+
+    await ProductCategory.bulkCreate(
+      validatedAssignments.map(a => ({
+        productId: uniqueId,
+        categoryId: a.categoryId,
+        subCategoryId: a.subCategoryId,
+        isPrimary: a.isPrimary
+      })),
+      { transaction }
+    );
+
+    await transaction.commit();
+
+    const allCategories = await Category.findAll({ raw: true });
+    const categoryMap = {};
+    allCategories.forEach(c => categoryMap[c.id] = c.name);
+
+    const fullProduct = await Product.findOne({
+      where: { id: uniqueId },
+      include: [{ model: ProductCategory, as: 'categoryAssignments', required: false }]
+    });
+
+    const responseData = enrichProductWithCategories(fullProduct.toJSON(), fullProduct.categoryAssignments, categoryMap);
+    res.status(201).json(responseData);
+  } catch (error) {
+    await transaction.rollback();
+    console.error('================ PRODUCT CREATE ERROR ================', error);
+    res.status(error.statusCode || 500).json({ message: error.message });
+  }
+};
+
+// @desc    Bulk create products
+// @route   POST /api/products/bulk
+// @access  Private/Admin
+export const bulkCreateProducts = async (req, res) => {
+  if (!Array.isArray(req.body)) {
+    return res.status(400).json({ message: 'Payload must be an array of products' });
+  }
+
+  const transaction = await sequelize.transaction();
+  try {
+    const productsToCreate = [];
+    const assignmentsToCreate = [];
+
+    for (const p of req.body) {
+      const uniqueId = p.id || crypto.randomUUID();
+      const catAssignments = await validateAndNormalizeAssignments(p.categoryAssignments, p.category, p.subCategory);
+      const primaryCat = catAssignments[0].categoryId;
+      const primarySubCat = catAssignments[0].subCategoryId || '';
+
+      productsToCreate.push({
+        id: uniqueId,
+        name: p.name,
+        sku: p.sku || uniqueId.substring(0, 8).toUpperCase(),
+        price: Number(p.price) || 0,
+        discountPrice: p.discountPrice ? Number(p.discountPrice) : 0,
+        originalPrice: p.originalPrice ? Number(p.originalPrice) : 0,
+        image: p.image || '/assets/hero_banner.png',
+        images: Array.isArray(p.images) ? p.images : [],
+        videoUrls: Array.isArray(p.videoUrls) ? p.videoUrls : [],
+        category: primaryCat,
+        masterCategory: p.masterCategory || primaryCat,
+        subCategory: primarySubCat,
+        occasion: p.occasion || '',
+        tags: Array.isArray(p.tags) ? p.tags : [],
+        stockQuantity: p.stockQuantity !== undefined ? Number(p.stockQuantity) : 0,
+        rating: p.rating ? Number(p.rating) : 4.5,
+        description: p.description || '',
+        shortDescription: p.shortDescription || '',
+        details: Array.isArray(p.details) ? p.details : [],
+        customization: p.customization || '',
+        shipping: p.shipping || '',
+        watermarkSettings: p.watermarkSettings || { enabled: false },
+        customGiftTagEnabled: !!p.customGiftTagEnabled,
+        customizationText: p.customizationText || '',
+        deliveryInfoText: p.deliveryInfoText || '',
+        addonsEnabled: !!p.addonsEnabled,
+        customAddons: Array.isArray(p.customAddons) ? p.customAddons : [],
+        variants: Array.isArray(p.variants) ? p.variants : [],
+        variantsEnabled: !!p.variantsEnabled,
+        isFeatured: !!p.isFeatured,
+        isActive: p.isActive !== undefined ? !!p.isActive : true
+      });
+
+      catAssignments.forEach(a => {
+        assignmentsToCreate.push({
+          productId: uniqueId,
+          categoryId: a.categoryId,
+          subCategoryId: a.subCategoryId,
+          isPrimary: a.isPrimary
+        });
+      });
+    }
+
+    const createdProducts = await Product.bulkCreate(productsToCreate, { validate: true, transaction });
+    if (assignmentsToCreate.length > 0) {
+      await ProductCategory.bulkCreate(assignmentsToCreate, { transaction });
+    }
+
+    await transaction.commit();
+    res.status(201).json({ success: true, count: createdProducts.length });
+  } catch (error) {
+    await transaction.rollback();
+    console.error('================ PRODUCT BULK CREATE ERROR ================', error);
+    res.status(error.statusCode || 500).json({ message: error.message });
+  }
+};
+
+const applyWatermarkToProduct = async (product, req) => {
+  if (!product.image) return false;
+
+  const wmOptions = product.watermarkSettings || { enabled: false };
+  const r2Configured = isR2Configured();
+
+  // If local, enforce /uploads/ check
+  if (!r2Configured && !product.image.includes('/uploads/')) return false;
+
+  // Derive original clean URL/path
+  const urlObj = new URL(product.image);
+  let originalUrl = product.image.replace('_watermarked', '').replace('_original', '');
+  
+  if (r2Configured) {
+    try {
+      // R2 Logic
+      const response = await fetch(originalUrl);
+      if (!response.ok) throw new Error('Failed to fetch from R2');
+      const arrayBuffer = await response.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      
+      let finalBuffer = buffer;
+      let finalUrl = originalUrl;
+      
+      if (wmOptions.enabled) {
+        finalBuffer = await generateWatermarkedImage(buffer, {
+          enableWatermark: true,
+          position: wmOptions.position || 'Top Left'
+        });
+        
+        let key = urlObj.pathname.startsWith('/') ? urlObj.pathname.slice(1) : urlObj.pathname;
+        key = key.replace('.webp', '_watermarked.webp');
+        
+        const r2Client = getR2Client();
+        const command = new PutObjectCommand({
+          Bucket: process.env.R2_BUCKET_NAME,
+          Key: key,
+          Body: finalBuffer,
+          ContentType: 'image/webp',
+        });
+        await r2Client.send(command);
+        
+        const publicUrlBase = process.env.R2_PUBLIC_URL.endsWith('/') 
+          ? process.env.R2_PUBLIC_URL.slice(0, -1) 
+          : process.env.R2_PUBLIC_URL;
+        finalUrl = `${publicUrlBase}/${key}`;
+      }
+      product.image = finalUrl;
+      return true;
+    } catch (error) {
+      console.error('R2 watermark application failed', error);
+      return false;
+    }
+  } else {
+    // Local Filesystem Logic
+    let baseRelativePath = urlObj.pathname.replace('_watermarked', '').replace('_original', '');
+    const absoluteBasePath = path.join(__dirname, '../public', baseRelativePath);
+    const absoluteOriginalPath = absoluteBasePath.replace('.webp', '_original.webp');
+    
+    if (!fs.existsSync(absoluteOriginalPath) && fs.existsSync(absoluteBasePath)) {
+      await fs.promises.rename(absoluteBasePath, absoluteOriginalPath);
+    }
+
+    const sourcePath = fs.existsSync(absoluteOriginalPath) ? absoluteOriginalPath : absoluteBasePath;
+    if (!fs.existsSync(sourcePath)) return false;
+
+    const buffer = await fs.promises.readFile(sourcePath);
+    const protocol = req.protocol;
+    const host = req.get('host');
+    
+    if (wmOptions.enabled) {
+      const watermarkedBuffer = await generateWatermarkedImage(buffer, {
+        enableWatermark: true,
+        position: wmOptions.position || 'Top Left'
+      });
+      await fs.promises.writeFile(absoluteBasePath, watermarkedBuffer);
+      product.image = `${protocol}://${host}${baseRelativePath}`;
+    } else {
+      if (fs.existsSync(absoluteOriginalPath)) {
+        await fs.promises.copyFile(absoluteOriginalPath, absoluteBasePath);
+      }
+      product.image = `${protocol}://${host}${baseRelativePath}`;
+    }
+    return true;
+  }
+};
+
+// @desc    Update a product
+// @route   PUT /api/products/:id
+// @access  Private/Admin
+export const updateProduct = async (req, res) => {
+  const transaction = await sequelize.transaction();
+  try {
+    const product = await Product.findOne({ where: { id: req.params.id }, transaction });
+
+    if (!product) {
+      await transaction.rollback();
+      return res.status(404).json({ message: 'Product not found' });
+    }
+
+    if (req.body.categoryAssignments !== undefined || req.body.category !== undefined) {
+      const validatedAssignments = await validateAndNormalizeAssignments(
+        req.body.categoryAssignments,
+        req.body.category || product.category,
+        req.body.subCategory !== undefined ? req.body.subCategory : product.subCategory
+      );
+
+      // Replace assignments in ProductCategory
+      await ProductCategory.destroy({ where: { productId: product.id }, transaction });
+      await ProductCategory.bulkCreate(
+        validatedAssignments.map(a => ({
+          productId: product.id,
+          categoryId: a.categoryId,
+          subCategoryId: a.subCategoryId,
+          isPrimary: a.isPrimary
+        })),
+        { transaction }
+      );
+
+      // Keep primary category & subCategory updated on product
+      product.category = validatedAssignments[0].categoryId;
+      product.subCategory = validatedAssignments[0].subCategoryId || '';
+      if (!req.body.masterCategory) {
+        product.masterCategory = validatedAssignments[0].categoryId;
+      }
+    }
+
+    const fields = [
+      'name', 'sku', 'price', 'discountPrice', 'originalPrice', 'image', 'images', 'videoUrls',
+      'masterCategory', 'occasion', 'tags', 'stockQuantity',
+      'rating', 'description', 'shortDescription', 'details', 'customization', 'shipping',
+      'isFeatured', 'isActive', 'customGiftTagEnabled', 'addonsEnabled', 'customAddons', 'customizationText', 'deliveryInfoText', 'watermarkSettings',
+      'variants', 'variantsEnabled'
+    ];
+
+    fields.forEach(field => {
+      if (req.body[field] !== undefined) {
+        product[field] = req.body[field];
+      }
+    });
+
+    // Auto-regenerate watermark if settings changed
+    if (req.body.watermarkSettings !== undefined) {
+      try { await applyWatermarkToProduct(product, req); } catch (e) { console.error('Auto-watermark failed', e); }
+    }
+
+    await product.save({ transaction });
+    await transaction.commit();
+
+    const allCategories = await Category.findAll({ raw: true });
+    const categoryMap = {};
+    allCategories.forEach(c => categoryMap[c.id] = c.name);
+
+    const fullProduct = await Product.findOne({
+      where: { id: product.id },
+      include: [{ model: ProductCategory, as: 'categoryAssignments', required: false }]
+    });
+
+    const responseData = enrichProductWithCategories(fullProduct.toJSON(), fullProduct.categoryAssignments, categoryMap);
+    res.json(responseData);
+  } catch (error) {
+    await transaction.rollback();
+    console.error('================ PRODUCT UPDATE ERROR ================', error);
+    res.status(error.statusCode || 500).json({ message: error.message });
+  }
+};
+
+// @desc    Delete a product
+// @route   DELETE /api/products/:id
+// @access  Private/Admin
+export const deleteProduct = async (req, res) => {
+  try {
+    const product = await Product.findOne({ where: { id: req.params.id } });
+
+    if (product) {
+      await ProductCategory.destroy({ where: { productId: product.id } });
+      await product.destroy();
+      res.json({ message: 'Product deleted successfully' });
+    } else {
+      res.status(404).json({ message: 'Product not found' });
+    }
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// @desc    Bulk delete products
+// @route   POST /api/products/bulk-delete
+// @access  Private/Admin
+export const bulkDeleteProducts = async (req, res) => {
+  const { ids } = req.body;
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return res.status(400).json({ message: 'Please provide an array of product IDs' });
+  }
+  try {
+    await ProductCategory.destroy({ where: { productId: { [Op.in]: ids } } });
+    await Product.destroy({ where: { id: { [Op.in]: ids } } });
+    res.json({ message: 'Products deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// @desc    Bulk update products
+// @route   POST /api/products/bulk-update
+// @access  Private/Admin
+export const bulkUpdateProducts = async (req, res) => {
+  const { ids, updates } = req.body;
+  if (!Array.isArray(ids) || ids.length === 0 || !updates) {
+    return res.status(400).json({ message: 'Please provide IDs and updates object' });
+  }
+  try {
+    await Product.update(updates, { where: { id: { [Op.in]: ids } } });
+    res.json({ message: 'Products updated successfully' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// @desc    Duplicate a product
+// @route   POST /api/products/:id/duplicate
+// @access  Private/Admin
+export const duplicateProduct = async (req, res) => {
+  try {
+    const product = await Product.findOne({ where: { id: req.params.id } });
+    if (!product) return res.status(404).json({ message: 'Product not found' });
+    
+    const existingAssignments = await ProductCategory.findAll({
+      where: { productId: req.params.id },
+      raw: true
+    });
+
+    const uniqueId = crypto.randomUUID();
+    const productData = product.get({ plain: true });
+    
+    delete productData.id;
+    delete productData.createdAt;
+    delete productData.updatedAt;
+    
+    productData.id = uniqueId;
+    productData.name = `${productData.name} (Copy)`;
+    productData.sku = `${productData.sku}-COPY`;
+    productData.isActive = false;
+    
+    const duplicatedProduct = await Product.create(productData);
+
+    if (existingAssignments.length > 0) {
+      await ProductCategory.bulkCreate(
+        existingAssignments.map(a => ({
+          productId: uniqueId,
+          categoryId: a.categoryId,
+          subCategoryId: a.subCategoryId,
+          isPrimary: a.isPrimary
+        }))
+      );
+    }
+
+    const allCategories = await Category.findAll({ raw: true });
+    const categoryMap = {};
+    allCategories.forEach(c => categoryMap[c.id] = c.name);
+
+    const fullProduct = await Product.findOne({
+      where: { id: uniqueId },
+      include: [{ model: ProductCategory, as: 'categoryAssignments', required: false }]
+    });
+
+    const responseData = enrichProductWithCategories(fullProduct.toJSON(), fullProduct.categoryAssignments, categoryMap);
+    res.status(201).json(responseData);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// @desc    Increment product views
+// @route   POST /api/products/:id/view
+// @access  Public
+export const incrementProductViews = async (req, res) => {
+  try {
+    const product = await Product.findOne({ where: { id: req.params.id } });
+    if (product) {
+      product.views = (product.views || 0) + 1;
+      await product.save();
+      res.json({ success: true, views: product.views });
+    } else {
+      res.status(404).json({ message: 'Product not found' });
+    }
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// @desc    Increment product clicks
+// @route   POST /api/products/:id/click
+// @access  Public
+export const incrementProductClicks = async (req, res) => {
+  try {
+    const product = await Product.findOne({ where: { id: req.params.id } });
+    if (product) {
+      product.clicks = (product.clicks || 0) + 1;
+      await product.save();
+      res.json({ success: true, clicks: product.clicks });
+    } else {
+      res.status(404).json({ message: 'Product not found' });
+    }
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// @desc    Regenerate watermark for a product
+// @route   POST /api/products/:id/watermark
+// @access  Private/Admin
+export const regenerateWatermark = async (req, res) => {
+  try {
+    const product = await Product.findOne({ where: { id: req.params.id } });
+    if (!product) return res.status(404).json({ message: 'Product not found' });
+    
+    if (!product.image) {
+      return res.status(400).json({ message: 'Product image not found' });
+    }
+
+    const r2Configured = isR2Configured();
+
+    if (!r2Configured && !product.image.includes('/uploads/')) {
+       return res.status(400).json({ message: 'Product image not found or not local' });
+    }
+
+    const wmOptions = product.watermarkSettings || { enabled: false };
+    const urlObj = new URL(product.image);
+    let originalUrl = product.image.replace('_watermarked', '').replace('_original', '');
+
+    if (r2Configured) {
+      const response = await fetch(originalUrl);
+      if (!response.ok) return res.status(404).json({ message: 'Original image not found on R2' });
+      const arrayBuffer = await response.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      
+      let finalBuffer = buffer;
+      let finalUrl = originalUrl;
+      
+      if (wmOptions.enabled) {
+        finalBuffer = await generateWatermarkedImage(buffer, {
+          enableWatermark: true,
+          position: wmOptions.position || 'Top Left'
+        });
+        
+        let key = urlObj.pathname.startsWith('/') ? urlObj.pathname.slice(1) : urlObj.pathname;
+        key = key.replace('.webp', '_watermarked.webp');
+        
+        const r2Client = getR2Client();
+        const command = new PutObjectCommand({
+          Bucket: process.env.R2_BUCKET_NAME,
+          Key: key,
+          Body: finalBuffer,
+          ContentType: 'image/webp',
+        });
+        await r2Client.send(command);
+        
+        const publicUrlBase = process.env.R2_PUBLIC_URL.endsWith('/') 
+          ? process.env.R2_PUBLIC_URL.slice(0, -1) 
+          : process.env.R2_PUBLIC_URL;
+        finalUrl = `${publicUrlBase}/${key}`;
+      }
+      product.image = finalUrl;
+    } else {
+      let baseRelativePath = urlObj.pathname.replace('_watermarked', '').replace('_original', '');
+      const absoluteBasePath = path.join(__dirname, '../public', baseRelativePath);
+      const absoluteOriginalPath = absoluteBasePath.replace('.webp', '_original.webp');
+      
+      if (!fs.existsSync(absoluteOriginalPath) && fs.existsSync(absoluteBasePath)) {
+        await fs.promises.rename(absoluteBasePath, absoluteOriginalPath);
+      }
+  
+      const sourcePath = fs.existsSync(absoluteOriginalPath) ? absoluteOriginalPath : absoluteBasePath;
+  
+      if (!fs.existsSync(sourcePath)) {
+        return res.status(404).json({ message: 'Original image file not found on server' });
+      }
+  
+      const buffer = await fs.promises.readFile(sourcePath);
+      const protocol = req.protocol;
+      const host = req.get('host');
+      
+      if (wmOptions.enabled) {
+        const watermarkedBuffer = await generateWatermarkedImage(buffer, {
+          enableWatermark: true,
+          position: wmOptions.position || 'Top Left'
+        });
+        
+        await fs.promises.writeFile(absoluteBasePath, watermarkedBuffer);
+        product.image = `${protocol}://${host}${baseRelativePath}`;
+      } else {
+        if (fs.existsSync(absoluteOriginalPath)) {
+          await fs.promises.copyFile(absoluteOriginalPath, absoluteBasePath);
+        }
+        product.image = `${protocol}://${host}${baseRelativePath}`;
+      }
+    }
+
+    await product.save();
+    res.json({ message: 'Watermark regenerated successfully.', product });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// @desc    Bulk apply watermark settings
+// @route   POST /api/products/bulk-watermark
+// @access  Private/Admin
+export const bulkWatermarkProducts = async (req, res) => {
+  const { ids, settings } = req.body;
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return res.status(400).json({ message: 'Please provide an array of product IDs' });
+  }
+  try {
+    if (settings) {
+      await Product.update({ watermarkSettings: settings }, { where: { id: { [Op.in]: ids } } });
+    }
+    // Abstracted: the actual processing will be picked up by the background worker.
+    res.json({ message: 'Bulk watermark regeneration queued successfully.' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// @desc    Bulk update variants
+// @route   POST /api/products/bulk-variants
+// @access  Private/Admin
+export const bulkUpdateVariants = async (req, res) => {
+  const { ids, action, payload } = req.body;
+  
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return res.status(400).json({ message: 'Please provide an array of product IDs' });
+  }
+  
+  try {
+    const products = await Product.findAll({ where: { id: { [Op.in]: ids } } });
+    
+    for (const product of products) {
+      let variants = product.variants || [];
+      if (!Array.isArray(variants)) variants = [];
+      let updated = false;
+
+      if (action === 'ENABLE_VARIANTS') {
+        product.variantsEnabled = true;
+        updated = true;
+      } else if (action === 'DISABLE_VARIANTS') {
+        product.variantsEnabled = false;
+        updated = true;
+      } else if (action === 'ADD_VARIANT') {
+        // Only add if it doesn't have a variant with the exact same name
+        if (!variants.some(v => v.name.toLowerCase() === payload.name.toLowerCase())) {
+          variants.push({
+            id: crypto.randomUUID(),
+            name: payload.name,
+            price: payload.price,
+            sku: payload.sku || '',
+            stock: payload.stock,
+            isDefault: variants.length === 0
+          });
+          product.variants = variants;
+          product.variantsEnabled = true;
+          updated = true;
+        }
+      } else if (action === 'UPDATE_PRICE') {
+        // payload = { name: "Medium", amount: 100, type: "increase" } or { name: "Medium", amount: 1500, type: "set" }
+        variants.forEach(v => {
+          if (v.name.toLowerCase() === payload.name.toLowerCase()) {
+            let currentPrice = Number(v.price) || 0;
+            if (payload.type === 'increase') {
+              v.price = currentPrice + Number(payload.amount);
+            } else if (payload.type === 'decrease') {
+              v.price = Math.max(0, currentPrice - Number(payload.amount));
+            } else {
+              v.price = Number(payload.amount);
+            }
+            updated = true;
+          }
+        });
+        if (updated) product.variants = variants;
+      } else if (action === 'UPDATE_STOCK') {
+        variants.forEach(v => {
+          if (v.name.toLowerCase() === payload.name.toLowerCase()) {
+            v.stock = Number(payload.stock);
+            updated = true;
+          }
+        });
+        if (updated) product.variants = variants;
+      } else if (action === 'DELETE_VARIANT') {
+        const initialLength = variants.length;
+        variants = variants.filter(v => v.name.toLowerCase() !== payload.name.toLowerCase());
+        if (variants.length < initialLength) {
+          // If default was deleted, make first item default
+          if (!variants.some(v => v.isDefault) && variants.length > 0) {
+            variants[0].isDefault = true;
+          }
+          product.variants = variants;
+          updated = true;
+        }
+      }
+
+      if (updated) {
+        await product.save();
+      }
+    }
+    
+    res.json({ message: 'Bulk variant operation completed successfully' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
