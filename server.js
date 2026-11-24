@@ -15,6 +15,7 @@ if (!process.env.JWT_SECRET) {
 }
 
 import { connectDB } from './database/db.js';
+import { ensureExportsDir, resetOrphanedJobs } from './jobs/jobRunner.js';
 import authRoutes from './routes/auth.js';
 import productRoutes from './routes/products.js';
 import orderRoutes from './routes/orders.js';
@@ -36,7 +37,17 @@ app.set('trust proxy', 1);
 const PORT = process.env.PORT || 5000;
 
 // Connect to Database
-connectDB();
+connectDB().then(async () => {
+  // Prepare background job state after DB is ready.
+  ensureExportsDir();
+  try {
+    const { ExportJob } = await import('./database/models.js');
+    await ExportJob.sync(); // Create export_jobs table if missing (no destructive alter).
+  } catch (e) {
+    console.error('ExportJob.sync failed:', e.message);
+  }
+  resetOrphanedJobs().catch((e) => console.error('resetOrphanedJobs:', e));
+}).catch(() => { /* connectDB logs its own errors */ });
 
 // Global Middlewares
 app.use(cors());
@@ -89,7 +100,21 @@ app.get('/', (req, res) => {
 });
 
 // Start listening
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`HampersNest Backend running on port ${PORT}`);
   console.log(`- API Status: http://localhost:${PORT}`);
 });
+
+// If running locally on a custom port, also listen on port 5000 if available for asset compatibility
+if (Number(PORT) !== 5000) {
+  try {
+    const fallbackServer = app.listen(5000, () => {
+      console.log(`- Compatibility Listener: http://localhost:5000`);
+    });
+    fallbackServer.on('error', () => {
+      // Silently ignore if port 5000 is occupied
+    });
+  } catch (e) {
+    // Ignore if unavailable
+  }
+}
